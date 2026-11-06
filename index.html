@@ -214,11 +214,18 @@
   // split a flat (y = 0) geometry's triangles until no edge is longer than maxLen, then lay it on the ground
   function drape(THREE, g, maxLen) {
     if (g.index) g = g.toNonIndexed();
-    var P = g.attributes.position.array, UV = g.attributes.uv.array, m2 = maxLen * maxLen, op = [], ou = [], on = [];
+    var P = g.attributes.position.array, UV = g.attributes.uv.array, m2 = maxLen * maxLen, op = [], ou = [], on = [], oi = [], seen = new Map();
     function V(i) { return [P[i * 3], P[i * 3 + 2], UV[i * 2], UV[i * 2 + 1]]; } // x, z, u, v
     function d2(a, b) { var dx = a[0] - b[0], dz = a[1] - b[1]; return dx * dx + dz * dz; }
     function mid(a, b) { return [(a[0] + b[0]) / 2, (a[1] + b[1]) / 2, (a[2] + b[2]) / 2, (a[3] + b[3]) / 2]; }
-    function put(a) { var nn = normalAt(a[0], -a[1]); op.push(a[0], elevAt(a[0], -a[1]), a[1]); ou.push(a[2], a[3]); on.push(nn[0], nn[1], nn[2]); }
+    function put(a) { // shared corners are stored once
+      var key = Math.round(a[0] * 50) + ',' + Math.round(a[1] * 50), at = seen.get(key);
+      if (at === undefined) {
+        at = op.length / 3; seen.set(key, at);
+        var nn = normalAt(a[0], -a[1]); op.push(a[0], elevAt(a[0], -a[1]), a[1]); ou.push(a[2], a[3]); on.push(nn[0], nn[1], nn[2]);
+      }
+      oi.push(at);
+    }
     function split(a, b, c, depth) {
       var ab = d2(a, b), bc = d2(b, c), ca = d2(c, a), mx = Math.max(ab, bc, ca);
       if (mx <= m2 || depth > 14) { put(a); put(b); put(c); return; }
@@ -233,6 +240,7 @@
     out.setAttribute('position', new THREE.Float32BufferAttribute(op, 3));
     out.setAttribute('normal', new THREE.Float32BufferAttribute(on, 3));
     out.setAttribute('uv', new THREE.Float32BufferAttribute(ou, 2));
+    out.setIndex(oi);
     return out;
   }
   // extra points along a polyline so ribbons and walls can follow the ground
@@ -1133,7 +1141,7 @@
 
     var renderer;
     try {
-      renderer = new THREE.WebGLRenderer({ canvas: canvas, antialias: false, preserveDrawingBuffer: true, powerPreference: 'high-performance' });
+      renderer = new THREE.WebGLRenderer({ canvas: canvas, antialias: false, preserveDrawingBuffer: false, powerPreference: 'high-performance' });
     } catch (e) {
       if (opts.onError) opts.onError('This browser could not start WebGL, which the 3D model needs.');
       return null;
@@ -1314,13 +1322,14 @@
       });
       ORDER.forEach(function (k, i) {
         var o = acc[k]; if (!o) return;
-        var g = new THREE.BufferGeometry();
-        g.setAttribute('position', new THREE.Float32BufferAttribute(o.pos, 3));
+        // lay the ribbon on the ground before it is copied into the geometry
         var nor = new Float32Array(o.pos.length);
         for (var j = 0; j < nor.length; j += 3) {
           o.pos[j + 1] = elevAt(o.pos[j], -o.pos[j + 2]);
           var nn = normalAt(o.pos[j], -o.pos[j + 2]); nor[j] = nn[0]; nor[j + 1] = nn[1]; nor[j + 2] = nn[2];
         }
+        var g = new THREE.BufferGeometry();
+        g.setAttribute('position', new THREE.Float32BufferAttribute(o.pos, 3));
         g.setAttribute('normal', new THREE.BufferAttribute(nor, 3));
         g.setAttribute('uv', new THREE.Float32BufferAttribute(o.uv, 2));
         g.setIndex(o.pos.length / 3 > 65535 ? new THREE.Uint32BufferAttribute(o.idx, 1) : new THREE.Uint16BufferAttribute(o.idx, 1));
@@ -1438,15 +1447,20 @@
 
     // ---- trees --------------------------------------------------------
     stages.push(function () {
-      var crownGeo = new THREE.IcosahedronGeometry(1, 1);
-      var p = crownGeo.attributes.position;
-      for (var i = 0; i < p.count; i++) {
-        var x = p.getX(i), y = p.getY(i), z = p.getZ(i);
-        var k = 1 + 0.12 * Math.sin(x * 5.1 + y * 3.7) + 0.08 * Math.sin(z * 6.3 - x * 2.1);
-        p.setXYZ(i, x * k, y * k, z * k);
+      // crown: a lumpy icosahedron; 80 faces up close, 20 when the camera is far out (see updateCamera)
+      function crown(detail) {
+        var cg = new THREE.IcosahedronGeometry(1, detail), cp = cg.attributes.position;
+        for (var ci = 0; ci < cp.count; ci++) {
+          var cx = cp.getX(ci), cy2 = cp.getY(ci), cz = cp.getZ(ci);
+          var ck = 1 + 0.12 * Math.sin(cx * 5.1 + cy2 * 3.7) + 0.08 * Math.sin(cz * 6.3 - cx * 2.1);
+          cp.setXYZ(ci, cx * ck, cy2 * ck, cz * ck);
+        }
+        cg.computeVertexNormals();
+        return cg;
       }
-      crownGeo.computeVertexNormals();
-      var trunkGeo = new THREE.CylinderGeometry(0.28, 0.42, 1, 6);
+      var crownGeo = crown(1), i;
+      built.crownNear = crownGeo; built.crownFar = crown(0);
+      var trunkGeo = new THREE.CylinderGeometry(0.28, 0.42, 1, 6, 1, true); // open ends: the caps are never seen
       trunkGeo.translate(0, 0.5, 0);
       var coneGeo = new THREE.ConeGeometry(1, 1, 8);
       coneGeo.translate(0, 0.5, 0);
@@ -1959,7 +1973,12 @@
     canvas.style.touchAction = 'none';
     canvas.style.cursor = 'grab';
 
+    var TREE_LOD_R = 1000; // camera distance beyond which trees use the 20-face crowns
     function updateCamera() {
+      if (built.trees && built.crownFar) {
+        var farOut = cur.radius > TREE_LOD_R;
+        if (farOut !== built.treesFar) { built.treesFar = farOut; built.trees.geometry = farOut ? built.crownFar : built.crownNear; }
+      }
       if (S.spin) goal.theta += 0.0011;
       var moved = false;
       ['theta', 'phi', 'radius', 'tx', 'tz'].forEach(function (k) {
